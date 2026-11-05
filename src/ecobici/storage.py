@@ -31,6 +31,12 @@ def write_bronze(source: str, payload: dict, ts: datetime) -> Path:
     return path
 
 
+def has_silver_for_day(table: str, ts: datetime) -> bool:
+    """True si ya existe al menos un archivo de la tabla para la fecha (UTC) de ts."""
+    folder = config.DATA_DIR / "silver" / table / _partition(ts)
+    return folder.exists() and any(folder.glob("*.parquet"))
+
+
 def write_silver(table: str, df: pd.DataFrame, ts: datetime) -> Path:
     path = config.DATA_DIR / "silver" / table / _partition(ts) / f"{int(ts.timestamp())}.parquet"
     path.parent.mkdir(parents=True, exist_ok=True)

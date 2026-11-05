@@ -17,13 +17,17 @@ from . import gbfs, quality, storage, weather
 def run_once(with_weather: bool = True) -> dict:
     ts = datetime.now(timezone.utc)
     info_raw, status_raw = gbfs.fetch_feeds()
-    storage.write_bronze("station_information", info_raw, ts)
     storage.write_bronze("station_status", status_raw, ts)
 
     info = gbfs.station_information_df(info_raw)
     status = quality.check_status(gbfs.station_status_df(status_raw, ts), info)
-    storage.write_silver("dim_station", info, ts)
     storage.write_silver("fact_station_status", status, ts)
+
+    # El catálogo casi no cambia: se usa en cada corrida para validar,
+    # pero solo se guarda una vez al día (medido: guardarlo siempre duplicaba el peso total).
+    if not storage.has_silver_for_day("dim_station", ts):
+        storage.write_bronze("station_information", info_raw, ts)
+        storage.write_silver("dim_station", info, ts)
 
     result = {"ts": ts.isoformat(), "estaciones": len(info), "calidad": quality.summary(status)}
     if with_weather:

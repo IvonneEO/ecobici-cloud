@@ -64,6 +64,15 @@ def test_weather_df():
     assert df["precipitation"].tolist() == [0, 1.2]
 
 
+def test_catalogo_una_vez_al_dia(tmp_path, monkeypatch):
+    monkeypatch.setattr("ecobici.config.DATA_DIR", tmp_path)
+    assert not storage.has_silver_for_day("dim_station", NOW)
+    storage.write_silver("dim_station", gbfs.station_information_df(INFO), NOW)
+    assert storage.has_silver_for_day("dim_station", NOW)
+    otro_dia = NOW.replace(day=4)
+    assert not storage.has_silver_for_day("dim_station", otro_dia)
+
+
 def test_particionado(tmp_path, monkeypatch):
     monkeypatch.setattr("ecobici.config.DATA_DIR", tmp_path)
     p = storage.write_bronze("station_status", STATUS, NOW)

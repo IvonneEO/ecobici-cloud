@@ -1,179 +1,172 @@
 # Ecobici Cloud: predicción de disponibilidad por estación
 
-Proyecto de Cómputo en la Nube. Perfil técnico.
-Objetivo: predecir bicis y anclajes libres por estación a 30–60 minutos y señalar estaciones que necesitan rebalanceo.
+Proyecto de la materia de Cómputo en la Nube (Maestría en Ciencia de Datos, Universidad Panamericana).
+
+**Objetivo:** predecir cuántas bicis y anclajes libres habrá en cada estación de Ecobici en los próximos 30 a 60 minutos, y señalar qué estaciones necesitan rebalanceo antes de que se vacíen o se saturen.
+
+Este repositorio contiene la ingesta de datos en local (con la misma estructura que tendrá en AWS), las reglas de calidad, las pruebas y la exploración de viajes históricos.
 
 ---
 
-## 1. Cómo correrlo en local
+## Estructura
+
+```
+ecobici-cloud/
+├── src/ecobici/
+│   ├── config.py         # URLs, zona horaria y rutas (sobreescribibles por variables de entorno)
+│   ├── http.py           # cliente HTTP con reintentos y backoff
+│   ├── gbfs.py           # descarga y tipado del feed GBFS de Ecobici
+│   ├── weather.py        # clima horario de Open-Meteo
+│   ├── quality.py        # reglas de calidad (banderas dq_*)
+│   ├── storage.py        # escritura bronze/silver particionada por fecha
+│   └── run_snapshot.py   # punto de entrada: una corrida = un snapshot
+├── tests/                # pruebas offline (no usan internet)
+├── notebooks/
+│   └── 01_exploracion_viajes.ipynb   # exploración de viajes históricos
+├── medir.py              # resumen de una captura: pesos, huecos y calidad
+└── pyproject.toml
+```
+
+## Cómo correrlo
+
+Requiere Python 3.10 o mayor.
 
 ```bash
-python -m venv .venv && source .venv/bin/activate   
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
-pytest                                   # pruebas offline (no usan internet)
-python -m ecobici.run_snapshot           # un snapshot real
-python -m ecobici.run_snapshot --loop 120  # un snapshot cada 2 minutos
+
+pytest                                      # pruebas offline
+python -m ecobici.run_snapshot              # un snapshot
+python -m ecobici.run_snapshot --loop 120   # un snapshot cada 2 minutos
+python medir.py                             # resumen de lo capturado
 ```
 
-Cada corrida imprime cuántas estaciones llegaron y el resumen de calidad. Los datos quedan en `data/` con la misma estructura de carpetas que tendrá el bucket de S3.
+En macOS, para que la captura no se detenga si la computadora entra en reposo:
 
----
-
-## 2. Origen del dato, forma de consumo y frecuencia
-
-| Fuente | Qué trae | Consumo | Frecuencia de cambio | Frecuencia de consulta |
-|---|---|---|---|---|
-| GBFS `station_status` | Bicis y anclajes libres, estado de cada estación | API REST pública, JSON, sin llave | El feed declara un `ttl` (típicamente 60 s) | Cada 2 minutos |
-| GBFS `station_information` | Catálogo: nombre, coordenadas, capacidad | API REST pública, JSON, sin llave | Rara vez (altas, bajas, cambios de capacidad) | Junto con cada snapshot (es pequeño) o 1 vez al día |
-| Open-Meteo | Temperatura, lluvia, viento por hora | API REST, JSON, sin llave (uso no comercial, < 10,000 llamadas/día) | Cada hora | 1 vez por hora |
-| Viajes históricos Ecobici | Un registro por viaje (retiro, arribo, estaciones, bici, edad, género) | Archivo CSV mensual en el portal de datos abiertos | Mensual | 1 vez al mes |
-| Calendario (festivos, quincenas) | Variables de calendario | Lo generamos nosotros | Anual | Se regenera 1 vez al año |
-
-Punto clave: el feed solo entrega el **estado actual**. El histórico de disponibilidad no existe en ningún lado; lo construimos nosotros capturando snapshots desde el día uno. Por eso la ingesta debe empezar ya, aunque el modelo llegue después.
-
----
-
-## 3. Tipo de dato, peso y almacenamiento
-
-| Fuente | Tipo | Peso aproximado | Dónde vive |
-|---|---|---|---|
-| `station_status` crudo | Semiestructurado (JSON) | ~190 KB por snapshot (≈687 estaciones × ~280 B). A 720 snapshots/día: ~135 MB/día sin comprimir, ~15 MB/día en gzip, ~0.45 GB/mes | S3 bronze (gzip) |
-| `station_status` limpio | Estructurado (Parquet) | ~500 mil filas/día; ~5 MB/día en Parquet+snappy, ~150 MB/mes | S3 silver |
-| `station_information` | Semiestructurado → estructurado | ~150 KB | S3 (bronze y silver) |
-| Clima | Semiestructurado → estructurado | < 10 KB por hora | S3 |
-| Viajes históricos | Estructurado (CSV) | ~97 MB por mes, ~1 millón de viajes | S3 bronze; Parquet en silver |
-
-> Los pesos son estimaciones. Validarlos con las primeras 24 h de captura (basta con `du -sh data/`) y actualizar esta tabla y la calculadora de costos.
-
-**¿Sirve S3?** Sí, como almacenamiento principal (data lake):
-
-- **S3 bronze:** JSON crudo comprimido. Permite auditar y reprocesar si cambia la lógica.
-- **S3 silver:** Parquet particionado por fecha (`dt=YYYY-MM-DD`), consultable con **Athena** usando el catálogo de **Glue**. Athena cobra por datos leídos, y Parquet + particiones lo abaratan mucho.
-- **Lo que S3 no resuelve:** consultas de baja latencia para la app ("¿cuántas bicis habrá en la estación X en 30 min?"). Para eso, una tabla pequeña en **DynamoDB** con la última predicción por estación.
-- **Orquestación:** EventBridge (cada 2 min) → Lambda con este mismo código. Reentrenamiento semanal en SageMaker o en una Lambda/contenedor si el modelo es ligero.
-
----
-
-## 4. Modelo de datos
-
-Esquema estrella. Las llaves de unión son `station_id` y la hora.
-
-```
-dim_station (1) ───< (N) fact_station_status_snapshot
-     │                         │ (por hora)
-     │                         └──> fact_weather_hourly
-     │                         └──> dim_calendar (por fecha)
-     └───< (N) fact_trip  (estación de retiro y de arribo)
-
-fact_prediction: salida del modelo, también ligada a dim_station
+```bash
+caffeinate -i python -m ecobici.run_snapshot --loop 120
 ```
 
-### dim_station
-| Campo | Tipo | Nulo | Descripción |
+Los datos se guardan en `data/` (excluida de Git) con la misma estructura de carpetas que tendrá el bucket de S3:
+
+```
+data/bronze/<fuente>/dt=YYYY-MM-DD/hour=HH/<epoch>.json.gz   # crudo, tal cual llegó
+data/silver/<tabla>/dt=YYYY-MM-DD/<epoch>.parquet            # limpio y tipado
+```
+
+Las particiones `dt=` usan la fecha **UTC**: lo capturado en CDMX después de las 18:00 queda en la partición del día siguiente.
+
+---
+
+## Fuentes de datos
+
+| Fuente | Qué trae | Consumo | Frecuencia de consulta |
 |---|---|---|---|
-| station_id | string (PK) | No | ID del feed GBFS |
-| name | string | No | Nombre de la estación |
-| short_name | string | No | Código corto ("001", "271-272"). **Llave de unión con fact_trip** (validado: 100% de coincidencia) |
-| lat, lon | float64 | No | Coordenadas WGS84 |
-| capacity | int16 | Sí | Total de anclajes |
-| valid_from, valid_to | timestamp | valid_to sí | Vigencia del registro, para cuando cambie capacidad o ubicación (SCD tipo 2) |
+| Ecobici GBFS: `station_status` | Bicis y anclajes libres, estado de cada estación | API pública, JSON, sin registro | Cada 2 minutos |
+| Ecobici GBFS: `station_information` | Catálogo: nombre, coordenadas, capacidad | API pública, JSON, sin registro | Se consulta en cada corrida para validar; se guarda una vez al día |
+| Open-Meteo | Temperatura, lluvia y viento por hora en CDMX | API pública, JSON, sin registro (uso no comercial, < 10,000 llamadas/día, atribución CC BY 4.0) | Cada hora |
+| Viajes históricos de Ecobici | Un registro por viaje | CSV mensual del portal de datos abiertos | Mensual |
 
-### fact_station_status_snapshot (tabla principal)
-| Campo | Tipo | Nulo | Descripción |
+El feed solo entrega el estado **actual**: el histórico de disponibilidad por estación no existe en ningún lado y se construye capturando snapshots.
+
+---
+
+## Resultados de la primera captura (4 al 5 de noviembre de 2026)
+
+**Captura:** del 4 de noviembre a las 17:39 al 5 de noviembre a las 10:04 (hora CDMX). 489 snapshots en 16.4 horas, 99.2% de completitud y 677 estaciones por snapshot. Un cierre accidental del proceso dejó un hueco menor a 5 minutos.
+
+### Pesos medidos
+
+| Capa | Por snapshot | Por día | Por mes |
 |---|---|---|---|
-| station_id | string (FK) | No | |
-| num_bikes_available | int16 | No | Bicis disponibles (variable objetivo) |
-| num_bikes_disabled | int16 | Sí | Bicis descompuestas en el anclaje |
-| num_docks_available | int16 | No | Anclajes libres (segunda variable objetivo) |
-| num_docks_disabled | int16 | Sí | Anclajes fuera de servicio |
-| is_installed, is_renting, is_returning | boolean | No | Estado operativo |
-| last_reported_ts | timestamp UTC | No | Cuándo reportó la estación |
-| feed_last_updated_ts | timestamp UTC | No | Cuándo se generó el feed |
-| ingested_at | timestamp UTC | No | Cuándo lo capturamos |
-| dq_* | boolean | No | Banderas de calidad (sección 5) |
+| Bronze `station_status` (JSON gzip) | 6.9 KB | ~5 MB | ~0.15 GB |
+| Silver `fact_station_status` (Parquet) | 24.2 KB | ~17 MB | ~0.52 GB |
+| Catálogo de estaciones | ~40 KB por copia | — | — |
 
-Llave natural: `(station_id, last_reported_ts)`. Partición: `dt`.
+- El total medido fue de **80.6 MB/día**, pero la mitad era el catálogo, que se guardaba en cada snapshot. **Ya se corrigió:** ahora se guarda una vez al día, lo que deja el total en ~23 MB/día (~0.7 GB/mes).
+- El Parquet pesa más que el JSON porque cada archivo es muy pequeño y carga sus propios metadatos. En la nube se compactará en un archivo por día.
+- Viajes históricos: ~100 MB y ~1.5 millones de viajes por mes en CSV.
 
-### fact_weather_hourly
-| Campo | Tipo | Descripción |
-|---|---|---|
-| ts_hour (PK) | timestamp UTC | Hora |
-| temperature_2m | float | °C |
-| precipitation, rain | float | mm |
-| wind_speed_10m | float | km/h |
-| weather_code | int | Código WMO |
+### Calidad del feed
 
-### dim_calendar
-`date (PK)`, `day_of_week`, `is_weekend`, `is_holiday`, `is_quincena`, `is_school_vacation`.
+- En plena operación (7:00 a 21:00), entre **86% y 93%** de las estaciones pasan todas las reglas.
+- En la apertura y el cierre (5–6 h y 22–23 h) baja a 51–78%, porque las estaciones se encienden y se apagan de forma escalonada. De 1:00 a 4:59 es casi 0%, porque el sistema está cerrado.
+- Solo 1 estación estuvo caída todo el periodo; el resto de los reportes atrasados son intermitentes.
+- Hubo 2 casos aislados de estaciones que reportaron más bicis y anclajes que su capacidad.
 
-### fact_trip (histórico mensual)
-| Campo | Tipo | Sensibilidad | Descripción |
+### Calidad de los viajes históricos (septiembre y octubre de 2026, 3.1 millones de viajes)
+
+- ~99.98% de los viajes pasa las reglas críticas. Ninguna fecha resultó ilegible.
+- Género: además de M y F existe `O` (otro, 1.8%) y `?` (no reportado, 2.5%), que se trata como dato faltante.
+- 61 viajes duran más de 24 horas (bicis perdidas o no ancladas). En los casos extremos, la bici salió entre febrero y junio y regresó en septiembre u octubre: **los archivos mensuales se organizan por fecha de llegada**, así que la partición debe usar la fecha de retiro.
+- 447 viajes de menos de 1 minuto, 106 edades atípicas y 59 edades vacías.
+- **Unión entre fuentes:** el 100% de las 676 estaciones de los viajes coincide con `short_name` del feed. Unir por `station_id` daría un falso 79% de coincidencia que asignaría viajes a estaciones equivocadas. La llave de unión es siempre `short_name`, como texto (para no perder ceros a la izquierda).
+
+### Hallazgos de demanda
+
+- Pico entre semana a las 8:00 y entre 17:00 y 18:00. Los fines de semana la demanda es más baja y se reparte entre 10:00 y 15:00.
+- En las mañanas, pocas estaciones concentran la pérdida de bicis (la principal pierde ~9,700 netas en dos meses) mientras otras se saturan. Son las prioritarias para el modelo y el rebalanceo.
+- Duración mediana del viaje: 12 minutos.
+
+---
+
+## Reglas de calidad (`quality.py`)
+
+Las filas no se borran: se marcan con banderas, para que el modelo decida qué excluir y para medir la calidad del feed en el tiempo.
+
+| Bandera | Regla |
+|---|---|
+| `dq_reporte_viejo` | La estación no reporta desde hace más de 30 minutos |
+| `dq_excede_capacidad` | Bicis + anclajes > capacidad |
+| `dq_negativo` | Conteos negativos |
+| `dq_sin_catalogo` | La estación no existe en el catálogo |
+| `dq_fuera_servicio` | Instalada pero sin prestar bicis |
+| `dq_duplicado` | Mismo `station_id` y `last_reported` |
+| `dq_ok` | Ninguna bandera activa |
+
+---
+
+## Modelo de datos
+
+Esquema estrella:
+
+| Tabla origen | Relación | Tabla destino | Campo de unión |
 |---|---|---|---|
-| trip_id | string (PK) | Baja | Generado: año-mes-índice |
-| bike_id | string | Baja | ID de la bici |
-| station_out_id, station_in_id | string (FK) | Baja | Estación de retiro y de arribo |
-| ts_out, ts_in | timestamp | Media | Fecha y hora; combinadas con estación pueden revelar rutinas |
-| duration_min | float | Baja | Derivado |
-| user_gender | string | **Alta** | Dato personal |
-| user_age_band | string | **Alta** | Guardar en rangos (18–24, 25–34…), nunca la edad exacta |
+| `dim_station` | 1 a muchos | `fact_station_status_snapshot` | `station_id` |
+| `dim_station` | 1 a muchos | `fact_trip` (retiro y llegada) | `short_name` |
+| `dim_station` | 1 a muchos | `fact_prediction` | `station_id` |
+| `fact_station_status_snapshot` | muchos a 1 | `fact_weather_hourly` | hora (UTC) |
+| `fact_station_status_snapshot` | muchos a 1 | `dim_calendar` | fecha |
 
-### fact_prediction (salida)
-`station_id`, `predicted_at`, `horizon_min` (30/60), `pred_bikes`, `pred_docks`, `p_empty`, `p_full`, `model_version`.
+**Datos personales:** solo `user_gender` y la edad de `fact_trip`. La edad se guarda en rangos y los viajes se usan solo agregados por estación y hora. Lo que alimenta la predicción en tiempo real (feed, clima, calendario) no contiene datos personales.
 
 ---
 
-## 5. Problemas de calidad esperados
+## Arquitectura en AWS (propuesta)
 
-Implementados como banderas en `src/ecobici/quality.py` (no se borran filas, se marcan):
+EventBridge Scheduler (cada 2 min) → Lambda de ingesta (este mismo código) → S3 bronze/silver → Glue Data Catalog → Athena para análisis → SageMaker para entrenamiento semanal → Lambda de inferencia (cada 10 min) → DynamoDB con la última predicción por estación → dashboard. CloudWatch para monitoreo y alertas.
 
-| Problema | Regla | Bandera |
-|---|---|---|
-| Estación que no reporta (caída o sin señal) | `last_reported` con más de 30 min de antigüedad | `dq_reporte_viejo` |
-| Estado imposible | bicis + anclajes > capacidad | `dq_excede_capacidad` |
-| Valores negativos | conteos < 0 | `dq_negativo` |
-| Estación en el status pero no en el catálogo | sin `capacity` tras el join | `dq_sin_catalogo` |
-| Estación instalada pero sin servicio | `is_installed` o `is_renting` falso | `dq_fuera_servicio` |
-| Snapshot repetido (el feed no se actualizó) | mismo `station_id` y `last_reported` | `dq_duplicado` |
+**¿Por qué S3 y no una base de datos relacional?** Lo crudo llega como JSON y se guarda tal cual para poder reprocesarlo. El proyecto es analítico, no transaccional: los snapshots solo se agregan, nunca se actualizan. Las tablas en Parquet se consultan con SQL desde Athena, y el costo es menor a 1 USD al mes en el escenario actual. DynamoDB se usa solo para la consulta rápida de la predicción por estación.
 
-Pendientes para siguientes iteraciones:
-
-- - **Llaves distintas entre fuentes:** el feed en vivo identifica estaciones con `station_id` (ID interno) y los CSV de viajes con un código corto. Se validó que el 100% de las 676 estaciones de los viajes coincide con `short_name` del feed, incluidas las estaciones dobles (p. ej. `271-272`). Unir por `station_id` daría un falso 79% de coincidencia que asignaría viajes a estaciones equivocadas sin generar error. **Regla:** la unión siempre es `fact_trip.station_out/in = dim_station.short_name`, conservando los IDs como texto para no perder ceros a la izquierda.
-- **Huecos de captura:** si la Lambda o el feed fallan, faltan snapshots. Medir completitud por hora.
-- **Zona horaria:** el feed usa epoch UTC; los CSV de viajes usan hora local. Todo se normaliza a UTC y se convierte a `America/Mexico_City` solo para features (hora del día).
-- **CSV de viajes inconsistentes:** fechas `dd/mm/aaaa`, IDs con ceros a la izquierda (`003`), nombres de columna que cambian entre años (p. ej. `Ciclo_EstacionArribo` sin guion bajo), edades atípicas, arribo anterior al retiro.
-- **Cambios de esquema o URL del feed:** las pruebas detectan si falta un campo obligatorio.
-
-- **Calidad:** la fuente es muy limpia; el ~99.98% de los viajes pasa todas las reglas críticas. Hallazgos:
-  - **Género:** además de M y F existe `O` (otro, 1.8%), que es válido, y `?` (no reportado, 2.5%), que se trata como dato faltante y no invalida el viaje.
-  - **Viajes que cruzan de mes:** 98 viajes con retiro el 31 de agosto aparecen en el archivo de septiembre porque llegaron ya en septiembre. Son legítimos; la partición por mes debe usar la fecha de retiro, no el archivo de origen.Es consistente con que los archivos se organizan por fecha de arribo.
-  - **Bicis perdidas o no ancladas:** 61 viajes duran más de 24 horas; los casos extremos (5) salieron entre febrero y junio y regresaron hasta septiembre u octubre, con más de 200 días fuera. No son errores de fecha: indican que los **archivos mensuales se organizan por fecha de arribo**. Por eso la ingesta debe particionar por fecha de retiro y no por archivo de origen. Estos viajes se excluyen del modelo de demanda, pero son un indicador útil de bicis perdidas para operación.
-  - **Otros:** viajes de menos de 1 minuto (447), edades atípicas (106), viajes de más de 24 horas (61) y edad nula (59).
-  - Ninguna fecha resultó ilegible.
+**Costo estimado** (us-east-1, precios de lista en USD, noviembre de 2026): ~26 USD al mes en el escenario actual, ~160 a 10x y ~1,419 a 100x. El dashboard representa ~81% del costo actual; el almacenamiento es casi irrelevante.
 
 ---
 
-## 6. Qué decisiones de negocio habilita
+## Próximos pasos
 
-1. **Rebalanceo:** a qué estaciones mandar camiones y a qué hora, antes de que se vacíen o se llenen.
-2. **Planeación de capacidad:** qué estaciones pasan más tiempo vacías o llenas y necesitan más anclajes, o dónde abrir estaciones nuevas.
-3. **Experiencia del usuario:** avisar "esta estación probablemente estará vacía en 20 min, la más cercana con bicis es X".
-4. **Mantenimiento:** estaciones con muchas bicis o anclajes deshabilitados de forma recurrente.
+- Aplicar las reglas de calidad y el modelo solo en el horario de operación (las reglas actuales marcan todas las estaciones de madrugada).
+- Compactar los Parquet de silver en un archivo por día.
+- Migrar `storage.py` a `boto3` y desplegar la ingesta en Lambda.
+- Cruzar viajes con clima histórico para medir el efecto de la lluvia en la demanda.
+- Entrenar el modelo base de pronóstico por estación.
 
----
-
-## 7. Regulación (avance para el perfil funcional)
-
-| Dato | ¿Personal? | Marco aplicable |
-|---|---|---|
-| Estado de estaciones, catálogo, clima | No | Términos de uso de cada fuente; Open-Meteo exige atribución y uso no comercial |
-| Viajes (edad, género, horarios, estaciones) | Sí, publicado como dato abierto pero potencialmente reidentificable | Ecobici es un sistema del gobierno de la CDMX, así que quien publica los datos se rige por la Ley de Protección de Datos Personales en Posesión de Sujetos Obligados de la Ciudad de México (vigilada por el INFO CDMX). Nosotros, como particulares que los tratamos, caeríamos en la LFPDPPP. Validar con el perfil funcional la versión vigente y qué autoridad la vigila, porque el marco federal cambió en 2025 |
-
-Medidas: usar viajes solo agregados por estación y hora, edad en rangos, cifrado en reposo en S3 (SSE-S3 o KMS) y acceso por IAM con mínimo privilegio.
-
----
-
-## 8. Fuera de alcance (por ahora)
+## Fuera de alcance
 
 - Optimización de rutas de los camiones de rebalanceo.
-- Datos de usuarios individuales o perfiles de uso.
-- App móvil propia (la salida es dashboard + endpoint).
+- Datos o perfiles de usuarios individuales.
+- App móvil propia.
+
+---
+
+Datos meteorológicos: [Open-Meteo.com](https://open-meteo.com/) (CC BY 4.0). Datos de estaciones y viajes: [Ecobici, datos abiertos](https://ecobici.cdmx.gob.mx/en/open-data/).
