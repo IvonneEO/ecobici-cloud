@@ -1,7 +1,6 @@
-"""Ingesta del feed GBFS de Ecobici.
+"""Transformación del feed GBFS de Ecobici a tablas tipadas (silver).
 
-Flujo: descubrimiento (gbfs.json) -> station_information + station_status
--> guarda crudo (bronze) -> aplana y tipa (silver).
+La descarga vive en feeds.py (sin pandas) para que la Lambda de ingesta sea ligera.
 """
 from __future__ import annotations
 
@@ -9,25 +8,7 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
-from . import config
-from .http import get_json
-
-
-def discover_feeds(discovery: dict) -> dict[str, str]:
-    """Devuelve {nombre_feed: url}. GBFS agrupa feeds por idioma (es/en/...)."""
-    data = discovery.get("data", {})
-    for lang in ("es", "en"):
-        if lang in data:
-            feeds = data[lang]["feeds"]
-            break
-    else:
-        feeds = next(iter(data.values()), {}).get("feeds", [])
-    return {f["name"]: f["url"] for f in feeds}
-
-
-def fetch_feeds() -> tuple[dict, dict]:
-    urls = discover_feeds(get_json(config.GBFS_DISCOVERY_URL))
-    return get_json(urls["station_information"]), get_json(urls["station_status"])
+from .feeds import discover_feeds, fetch_feeds  # noqa: F401  (se reexportan)
 
 
 # ---------- Transformación a silver ----------

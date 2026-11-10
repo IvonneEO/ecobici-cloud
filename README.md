@@ -4,7 +4,7 @@ Proyecto de la materia de Cómputo en la Nube (Maestría en Ciencia de Datos, Un
 
 **Objetivo:** predecir cuántas bicis y anclajes libres habrá en cada estación de Ecobici en los próximos 30 a 60 minutos, y señalar qué estaciones necesitan rebalanceo antes de que se vacíen o se saturen.
 
-Este repositorio contiene la ingesta de datos en local (con la misma estructura que tendrá en AWS), las reglas de calidad, las pruebas y la exploración de viajes históricos.
+Este repositorio contiene la ingesta de datos (en local y desplegada en AWS con infraestructura como código), la compactación diaria, las reglas de calidad, las pruebas y la exploración de viajes históricos.
 
 ---
 
@@ -13,14 +13,21 @@ Este repositorio contiene la ingesta de datos en local (con la misma estructura 
 ```
 ecobici-cloud/
 ├── src/ecobici/
-│   ├── config.py         # URLs, zona horaria y rutas (sobreescribibles por variables de entorno)
-│   ├── http.py           # cliente HTTP con reintentos y backoff
-│   ├── gbfs.py           # descarga y tipado del feed GBFS de Ecobici
-│   ├── weather.py        # clima horario de Open-Meteo
-│   ├── quality.py        # reglas de calidad (banderas dq_*)
-│   ├── storage.py        # escritura bronze/silver particionada por fecha
-│   └── run_snapshot.py   # punto de entrada: una corrida = un snapshot
-├── tests/                # pruebas offline (no usan internet)
+│   ├── config.py         # URLs, zona horaria, horario de operación y almacenamiento (variables de entorno)
+│   ├── http.py           # cliente HTTP con reintentos (solo librería estándar)
+│   ├── feeds.py          # descarga de GBFS y Open-Meteo, sin pandas
+│   ├── gbfs.py           # tipado del feed GBFS a tablas
+│   ├── weather.py        # tipado del clima horario
+│   ├── quality.py        # reglas de calidad (banderas dq_*) y en_horario
+│   ├── storage.py        # bronze/silver particionado por fecha, en local o en S3
+│   ├── run_snapshot.py   # captura local para desarrollo
+│   └── aws/
+│       ├── ingest.py     # Lambda: bronze cada 2 min (estado) y cada hora (clima)
+│       └── compact.py    # Lambda: silver diario, 1 Parquet por tabla
+├── template.yaml         # infraestructura (AWS SAM): S3, Lambdas, horarios, Athena, alarmas, presupuesto
+├── samconfig.toml        # configuración de despliegue
+├── docs/DESPLIEGUE.md    # guía paso a paso para desplegar en AWS
+├── tests/                # pruebas offline, incluido S3 simulado (moto)
 ├── notebooks/
 │   └── 01_exploracion_viajes.ipynb   # exploración de viajes históricos
 ├── medir.py              # resumen de una captura: pesos, huecos y calidad
@@ -36,7 +43,7 @@ python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 
-pytest                                      # pruebas offline
+python -m pytest                            # pruebas offline (incluye un día simulado en S3)
 python -m ecobici.run_snapshot              # un snapshot
 python -m ecobici.run_snapshot --loop 120   # un snapshot cada 2 minutos
 python medir.py                             # resumen de lo capturado
@@ -124,6 +131,7 @@ Las filas no se borran: se marcan con banderas, para que el modelo decida qué e
 | `dq_fuera_servicio` | Instalada pero sin prestar bicis |
 | `dq_duplicado` | Mismo `station_id` y `last_reported` |
 | `dq_ok` | Ninguna bandera activa |
+| `en_horario` | La hora local está dentro del horario de operación (fuera de 1:00 a 4:59). No es una bandera de error: indica qué filas evaluar y usar en el modelo |
 
 ---
 
@@ -143,9 +151,29 @@ Esquema estrella:
 
 ---
 
-## Arquitectura en AWS (propuesta)
+## Arquitectura en AWS
 
-EventBridge Scheduler (cada 2 min) → Lambda de ingesta (este mismo código) → S3 bronze/silver → Glue Data Catalog → Athena para análisis → SageMaker para entrenamiento semanal → Lambda de inferencia (cada 10 min) → DynamoDB con la última predicción por estación → dashboard. CloudWatch para monitoreo y alertas.
+**Implementado (`template.yaml`, guía en [docs/DESPLIEGUE.md](docs/DESPLIEGUE.md)):**
+
+```
+EventBridge Scheduler ──(cada 2 min)──► Lambda ingest ──► S3 bronze/station_status   (JSON gzip)
+                      ──(cada hora)───► Lambda ingest ──► S3 bronze/weather
+                                                     └─► S3 bronze/station_information (1 vez al día)
+                      ──(00:15 UTC)───► Lambda compact ─► S3 silver/<tabla>/dt=YYYY-MM-DD/part-00000.parquet
+                                                              │
+                                            Glue Data Catalog (partition projection) ──► Athena
+CloudWatch (logs 14 días + 3 alarmas) ──► SNS ──► correo          AWS Budgets ──► correo
+```
+
+Decisiones de diseño:
+- **Ingesta sin pandas.** Corre 720 veces al día: un paquete de pocos KB arranca rápido y cuesta menos. La limpieza se hace una vez al día.
+- **Compactación diaria.** Resuelve el problema de archivos pequeños medido en la primera captura y aplica las reglas de calidad al día completo. Es idempotente: se puede volver a correr para cualquier fecha.
+- **Mínimo privilegio.** La ingesta solo puede escribir en `bronze/`; la compactación solo lee `bronze/` y escribe `silver/`.
+- **Seguridad del bucket.** Cifrado SSE-S3, acceso público bloqueado y solo conexiones HTTPS. El bucket se conserva si se borra el stack.
+- **Sin ciclo de vida a Glacier.** Los objetos pesan ~7 KB y S3 no transiciona objetos de menos de 128 KB; el ahorro calculado era menor a 1%.
+- **Control de costos.** Tope de 1 GB por consulta en Athena, logs con retención de 14 días y presupuesto mensual que mide el gasto real sin descontar créditos.
+
+**Siguiente fase (propuesta):** SageMaker para entrenamiento semanal → Lambda de inferencia (cada 10 min) → DynamoDB con la última predicción por estación → dashboard.
 
 **¿Por qué S3 y no una base de datos relacional?** Lo crudo llega como JSON y se guarda tal cual para poder reprocesarlo. El proyecto es analítico, no transaccional: los snapshots solo se agregan, nunca se actualizan. Las tablas en Parquet se consultan con SQL desde Athena, y el costo es menor a 1 USD al mes en el escenario actual. DynamoDB se usa solo para la consulta rápida de la predicción por estación.
 
@@ -155,9 +183,7 @@ EventBridge Scheduler (cada 2 min) → Lambda de ingesta (este mismo código) �
 
 ## Próximos pasos
 
-- Aplicar las reglas de calidad y el modelo solo en el horario de operación (las reglas actuales marcan todas las estaciones de madrugada).
-- Compactar los Parquet de silver en un archivo por día.
-- Migrar `storage.py` a `boto3` y desplegar la ingesta en Lambda.
+- Acumular al menos dos semanas de snapshots en AWS antes de entrenar.
 - Cruzar viajes con clima histórico para medir el efecto de la lluvia en la demanda.
 - Entrenar el modelo base de pronóstico por estación.
 

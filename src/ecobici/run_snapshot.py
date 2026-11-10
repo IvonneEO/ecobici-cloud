@@ -1,8 +1,9 @@
-"""Punto de entrada: una corrida = un snapshot.
+"""Captura local para desarrollo: una corrida = un snapshot (bronze + silver por snapshot).
 
 Local:      python -m ecobici.run_snapshot            (una vez)
             python -m ecobici.run_snapshot --loop 120 (cada 2 minutos)
-En AWS:     el mismo código dentro de una Lambda disparada por EventBridge.
+En AWS:     ecobici.aws.ingest guarda bronze cada 2 minutos y
+            ecobici.aws.compact arma silver una vez al día.
 """
 from __future__ import annotations
 
@@ -11,12 +12,12 @@ import json
 import time
 from datetime import datetime, timezone
 
-from . import gbfs, quality, storage, weather
+from . import feeds, gbfs, quality, storage, weather
 
 
 def run_once(with_weather: bool = True) -> dict:
     ts = datetime.now(timezone.utc)
-    info_raw, status_raw = gbfs.fetch_feeds()
+    info_raw, status_raw = feeds.fetch_feeds()
     storage.write_bronze("station_status", status_raw, ts)
 
     info = gbfs.station_information_df(info_raw)
@@ -31,7 +32,7 @@ def run_once(with_weather: bool = True) -> dict:
 
     result = {"ts": ts.isoformat(), "estaciones": len(info), "calidad": quality.summary(status)}
     if with_weather:
-        w_raw = weather.fetch_weather()
+        w_raw = feeds.fetch_weather()
         storage.write_bronze("weather", w_raw, ts)
         storage.write_silver("fact_weather_hourly", weather.weather_df(w_raw), ts)
     return result
