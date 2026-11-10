@@ -1,0 +1,392 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Ecobici Cloud: ingesta del feed GBFS de Ecobici y del clima de Open-Meteo a S3,
+  compactación diaria a Parquet, catálogo para Athena, monitoreo y presupuesto.
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: Correo que recibe las alarmas y los avisos de presupuesto (hay que confirmar la suscripción).
+  MonthlyBudgetUSD:
+    Type: Number
+    Default: 5
+    Description: Presupuesto mensual de la cuenta en USD (sin descontar créditos).
+  PandasLayerArn:
+    Type: String
+    # Capa administrada "AWS SDK for pandas" (pandas + pyarrow) para Python 3.12 x86_64 en us-east-1.
+    # Lista vigente: https://aws-sdk-pandas.readthedocs.io/en/stable/layers.html
+    Default: arn:aws:lambda:us-east-1:336392948345:layer:AWSSDKPandas-Python312:32
+  DataStartDate:
+    Type: String
+    Default: "2026-11-01"
+    Description: Primera fecha (yyyy-MM-dd) que Athena considera al proyectar particiones.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [x86_64]
+    CodeUri: src/
+    Environment:
+      Variables:
+        ECOBICI_STORAGE: s3
+        ECOBICI_BUCKET: !Ref DataBucket
+
+Resources:
+  # ---------------------------------------------------------------- Almacenamiento
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain          # si se borra el stack, los datos se conservan
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256  # SSE-S3
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      # Sin reglas de ciclo de vida a Glacier: los objetos pesan ~7 KB y S3 no
+      # transiciona objetos de menos de 128 KB; además el ahorro calculado era <1%.
+      Tags:
+        - Key: proyecto
+          Value: ecobici-cloud
+
+  DataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataBucket
+      PolicyDocument:
+        Statement:
+          - Sid: SoloHTTPS
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt DataBucket.Arn
+              - !Sub "${DataBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ---------------------------------------------------------------- Logs (14 días)
+  IngestLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecobici/${AWS::StackName}/ingest"
+      RetentionInDays: 14
+
+  CompactLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecobici/${AWS::StackName}/compact"
+      RetentionInDays: 14
+
+  # ---------------------------------------------------------------- Lambdas
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Guarda en bronze el estado de estaciones (cada 2 min) y el clima (cada hora).
+      Handler: ecobici.aws.ingest.handler
+      MemorySize: 256
+      Timeout: 60
+      LoggingConfig:
+        LogGroup: !Ref IngestLogGroup
+      EventInvokeConfig:
+        MaximumEventAgeInSeconds: 120   # un snapshot de hace más de 2 min ya no sirve
+        MaximumRetryAttempts: 1
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub "${DataBucket.Arn}/bronze/*"
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !GetAtt DataBucket.Arn
+              Condition:
+                StringLike:
+                  s3:prefix: ["bronze/*"]
+      Events:
+        EstadoCada2Min:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: rate(2 minutes)
+            Input: '{"task": "status"}'
+            RetryPolicy:
+              MaximumRetryAttempts: 0
+        ClimaCadaHora:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: rate(1 hour)
+            Input: '{"task": "weather"}'
+            RetryPolicy:
+              MaximumRetryAttempts: 2
+
+  CompactFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Junta los snapshots del día anterior en un Parquet por tabla y aplica reglas de calidad.
+      Handler: ecobici.aws.compact.handler
+      MemorySize: 1024
+      Timeout: 600
+      Layers:
+        - !Ref PandasLayerArn
+      LoggingConfig:
+        LogGroup: !Ref CompactLogGroup
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "${DataBucket.Arn}/bronze/*"
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub "${DataBucket.Arn}/silver/*"
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !GetAtt DataBucket.Arn
+              Condition:
+                StringLike:
+                  s3:prefix: ["bronze/*"]
+      Events:
+        DiarioUTC:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: cron(15 0 * * ? *)   # 00:15 UTC = 18:15 en CDMX
+            Input: "{}"
+            RetryPolicy:
+              MaximumRetryAttempts: 2
+
+  # ---------------------------------------------------------------- Catálogo y Athena
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: ecobici
+        Description: Capa silver del proyecto Ecobici Cloud
+
+  FactStationStatusTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: fact_station_status
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          projection.enabled: "true"
+          projection.dt.type: date
+          projection.dt.format: yyyy-MM-dd
+          projection.dt.range: !Sub "${DataStartDate},NOW"
+          projection.dt.interval: "1"
+          projection.dt.interval.unit: DAYS
+          storage.location.template: !Sub "s3://${DataBucket}/silver/fact_station_status/dt=${!dt}/"
+        PartitionKeys:
+          - {Name: dt, Type: string}
+        StorageDescriptor:
+          Location: !Sub "s3://${DataBucket}/silver/fact_station_status/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: station_id, Type: string}
+            - {Name: num_bikes_available, Type: smallint}
+            - {Name: num_bikes_disabled, Type: smallint}
+            - {Name: num_docks_available, Type: smallint}
+            - {Name: num_docks_disabled, Type: smallint}
+            - {Name: is_installed, Type: boolean}
+            - {Name: is_renting, Type: boolean}
+            - {Name: is_returning, Type: boolean}
+            - {Name: last_reported, Type: bigint}
+            - {Name: last_reported_ts, Type: timestamp}
+            - {Name: feed_last_updated_ts, Type: timestamp}
+            - {Name: ingested_at, Type: timestamp}
+            - {Name: dq_sin_catalogo, Type: boolean}
+            - {Name: dq_negativo, Type: boolean}
+            - {Name: dq_excede_capacidad, Type: boolean}
+            - {Name: dq_reporte_viejo, Type: boolean}
+            - {Name: dq_fuera_servicio, Type: boolean}
+            - {Name: dq_duplicado, Type: boolean}
+            - {Name: dq_ok, Type: boolean}
+            - {Name: en_horario, Type: boolean}
+
+  DimStationTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: dim_station
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          projection.enabled: "true"
+          projection.dt.type: date
+          projection.dt.format: yyyy-MM-dd
+          projection.dt.range: !Sub "${DataStartDate},NOW"
+          projection.dt.interval: "1"
+          projection.dt.interval.unit: DAYS
+          storage.location.template: !Sub "s3://${DataBucket}/silver/dim_station/dt=${!dt}/"
+        PartitionKeys:
+          - {Name: dt, Type: string}
+        StorageDescriptor:
+          Location: !Sub "s3://${DataBucket}/silver/dim_station/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: station_id, Type: string}
+            - {Name: name, Type: string}
+            - {Name: short_name, Type: string}
+            - {Name: lat, Type: double}
+            - {Name: lon, Type: double}
+            - {Name: capacity, Type: smallint}
+
+  FactWeatherHourlyTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: fact_weather_hourly
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          projection.enabled: "true"
+          projection.dt.type: date
+          projection.dt.format: yyyy-MM-dd
+          projection.dt.range: !Sub "${DataStartDate},NOW"
+          projection.dt.interval: "1"
+          projection.dt.interval.unit: DAYS
+          storage.location.template: !Sub "s3://${DataBucket}/silver/fact_weather_hourly/dt=${!dt}/"
+        PartitionKeys:
+          - {Name: dt, Type: string}
+        StorageDescriptor:
+          Location: !Sub "s3://${DataBucket}/silver/fact_weather_hourly/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: ts_hour, Type: timestamp}
+            - {Name: temperature_2m, Type: double}
+            - {Name: precipitation, Type: double}
+            - {Name: rain, Type: double}
+            - {Name: wind_speed_10m, Type: double}
+            - {Name: weather_code, Type: double}
+
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}"
+      Description: Consultas del proyecto Ecobici con tope de datos por consulta
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        BytesScannedCutoffPerQuery: 1073741824   # 1 GB por consulta = máx. ~0.005 USD
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${DataBucket}/athena-results/"
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+
+  # ---------------------------------------------------------------- Monitoreo
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Ecobici Cloud alertas
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  IngestErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: La ingesta falló 3 o más veces en 10 minutos.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref IngestFunction}]
+      Statistic: Sum
+      Period: 600
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+      OKActions: [!Ref AlertsTopic]
+
+  IngestStoppedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: La ingesta no se ejecutó en 15 minutos (el scheduler o la función están detenidos).
+      Namespace: AWS/Lambda
+      MetricName: Invocations
+      Dimensions: [{Name: FunctionName, Value: !Ref IngestFunction}]
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlertsTopic]
+      OKActions: [!Ref AlertsTopic]
+
+  CompactErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: La compactación diaria falló.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref CompactFunction}]
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub "${AWS::StackName}-mensual"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetUSD
+          Unit: USD
+        CostTypes:
+          IncludeCredit: false   # mide el gasto real aunque lo cubran los créditos
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers: [{SubscriptionType: EMAIL, Address: !Ref AlertEmail}]
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers: [{SubscriptionType: EMAIL, Address: !Ref AlertEmail}]
+
+Outputs:
+  BucketName:
+    Description: Bucket con las capas bronze y silver
+    Value: !Ref DataBucket
+  IngestFunctionName:
+    Value: !Ref IngestFunction
+  CompactFunctionName:
+    Value: !Ref CompactFunction
+  AthenaWorkGroupName:
+    Value: !Ref AthenaWorkGroup

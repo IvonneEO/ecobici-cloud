@@ -13,12 +13,20 @@ OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 CDMX_LAT, CDMX_LON = 19.4326, -99.1332
 
 # Identificarse siempre: buena práctica con APIs públicas.
-USER_AGENT = os.environ.get("ECOBICI_USER_AGENT", "ecobici-cloud-proyecto-academico/0.1")
+USER_AGENT = os.environ.get("ECOBICI_USER_AGENT", "ecobici-cloud-proyecto-academico/0.2")
 HTTP_TIMEOUT_S = 15
 HTTP_RETRIES = 3
 
-# Destino local que imita la estructura que tendrá en S3:
+# Almacenamiento con la misma estructura en local y en S3:
 #   bronze/ = JSON crudo tal cual llegó (auditoría y reprocesamiento)
 #   silver/ = Parquet limpio y tipado (lo que consulta Athena / el modelo)
+# ECOBICI_STORAGE=local (default) escribe en DATA_DIR; =s3 escribe en ECOBICI_BUCKET.
+STORAGE = os.environ.get("ECOBICI_STORAGE", "local")
+BUCKET = os.environ.get("ECOBICI_BUCKET", "")
 DATA_DIR = Path(os.environ.get("ECOBICI_DATA_DIR", "data"))
 TIMEZONE = "America/Mexico_City"
+
+# Horario de operación de Ecobici (hora local). Medido en la primera captura:
+# sin viajes ni reportes confiables de 1:00 a 4:59.
+CLOSED_FROM_HOUR = 1
+CLOSED_UNTIL_HOUR = 5
