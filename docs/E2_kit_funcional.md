@@ -112,8 +112,6 @@ Lecturas útiles:
 
 ## Pendientes que solo puede resolver el perfil funcional
 
-- Número de equipo (para renombrar `E2`).
-- Nombre del dueño de datos en la tabla de linaje.
 - Decisión sobre replicación entre regiones, con su condición de cambio.
 - Redacción de los dos ADR, con fecha y responsable.
 - Roles y RACI finales.

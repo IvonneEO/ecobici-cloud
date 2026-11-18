@@ -3,9 +3,28 @@
 **Perfil técnico:** Ivonne Enciso · **Perfil funcional:** Emiliano
 **Repositorio:** código en la raíz del repo; este folder contiene el entregable y sus evidencias.
 
+## Índice: dónde está cada cosa
+
+| Qué buscas | Dónde está |
+|---|---|
+| Este documento (respuestas de la tarea) | [`E2/README.md`](README.md) |
+| Diagrama de arquitectura (imagen editable en draw.io) | [`E2/diagramas/arquitectura_ecobici.drawio.png`](diagramas/arquitectura_ecobici.drawio.png) |
+| Evidencias: consultas de Athena con bytes | [`E2/evidencias/athena_consultas.md`](evidencias/athena_consultas.md) |
+| Evidencias: las 3 capas en S3 | [`E2/evidencias/capas_s3.md`](evidencias/capas_s3.md) |
+| Evidencias: corridas del Job de Glue | [`E2/evidencias/glue_corridas.md`](evidencias/glue_corridas.md) |
+| Evidencias: ingesta automática | [`E2/evidencias/ingesta.md`](evidencias/ingesta.md) |
+| Evidencias: ciclo de vida (costos) | [`E2/evidencias/ciclo_de_vida.json`](evidencias/ciclo_de_vida.json) |
+| Evidencias: costo real en AWS | [`E2/evidencias/costos_reales.md`](evidencias/costos_reales.md) |
+| Kit con cifras para la Ruta 2 | [`docs/E2_kit_funcional.md`](../docs/E2_kit_funcional.md) |
+| Infraestructura completa (AWS SAM) | [`template.yaml`](../template.yaml) |
+| Job de Glue (raw → curated) | [`glue/curate_job.py`](../glue/curate_job.py) |
+| Código de ingesta y limpieza | [`src/ecobici/`](../src/ecobici/) |
+| Pruebas automáticas | [`tests/`](../tests/) |
+| Guía para desplegar | [`docs/DESPLIEGUE.md`](../docs/DESPLIEGUE.md) |
+
 ## Resumen
 
-Capturamos cada 2 minutos el estado de las ~677 estaciones de Ecobici (feed público GBFS) y el clima por hora (Open-Meteo). Los datos llegan crudos a S3. Un Job de Glue los convierte cada noche en Parquet particionado por fecha y se consultan con SQL en Athena. Todo está desplegado en AWS (us-east-1) con infraestructura como código (`template.yaml`, AWS SAM), monitoreo con alertas por correo y un presupuesto mensual. Costo real: **menos de 1 USD al mes**.
+Capturamos cada 2 minutos el estado de las ~677 estaciones de Ecobici (feed público GBFS) y el clima por hora (Open-Meteo). Los datos llegan crudos a S3. Un Job de Glue los convierte cada noche en Parquet particionado por fecha y se consultan con SQL en Athena. Todo está desplegado en AWS (us-east-1) con infraestructura como código (`template.yaml`, AWS SAM), monitoreo con alertas por correo y un presupuesto mensual. Costo real: **0.054 USD en los primeros 9 días** (≈ 2.19 USD proyectado a 12 meses).
 
 ```
 EventBridge Scheduler ─(cada 2 min)─► Lambda ingest ─► S3 bronze/  (raw: JSON gzip por snapshot)
@@ -35,11 +54,11 @@ Todas las capas se particionan por fecha UTC (`dt=YYYY-MM-DD/`). Evidencia: [`ev
 
 | Consulta | Bytes escaneados | Lectura |
 |---|---|---|
-| Q1. Calidad por hora de un día (con filtro de partición) | 58.3 KB | Lee 1 día y 2 columnas: el caso eficiente |
-| Q2. La misma, sin filtro de partición | 394.3 KB (6.8 × Q1) | Lee todos los días: muestra el ahorro del particionado, que crece con cada día capturado |
-| Q3. Estaciones que más tiempo pasaron vacías (JOIN) | 521.6 KB | Lee 4 columnas de los hechos y el catálogo; Parquet evita leer las demás |
+| Q1. Calidad por hora de un día (con filtro de partición) | 58.3 KB | Lee 1 día y 2 columnas |
+| Q2. La misma, sin filtro de partición | 394.3 KB (6.8 veces Q1) | Lee todos los días: muestra el ahorro del particionado |
+| Q3. Estaciones que más tiempo pasaron vacías (JOIN) | 521.6 KB | Consulta de negocio |
 
-Athena cobra un mínimo de 10 MB por consulta (~0.00005 USD), así que hoy las tres cuestan lo mismo; el particionado y Parquet son lo que mantiene el costo bajo cuando el histórico crezca. El Job de Glue procesó el 16/11/2026 en 54 s (~0.0004 USD por corrida).
+Athena cobra un mínimo de 10 MB por consulta, así que hoy cada una cuesta lo mismo (~0.00005 USD). La diferencia entre Q1 y Q2 sí importa a futuro: Q2 crece con cada día acumulado y Q1 no. Con un año de datos, Q2 leería ~365 veces más que Q1. Por su parte, la corrida del Job de Glue tardó 54 s y costó ~0.0004 USD.
 
 ### 2. Tablas con datos estructurados
 
@@ -128,7 +147,9 @@ Reglas vigentes: [`evidencias/ciclo_de_vida.json`](evidencias/ciclo_de_vida.json
 4. **Un snapshot perdido no se puede recuperar,** porque el feed solo da el estado actual. Por eso el Job de Glue mide y reporta la completitud del día (snapshots recibidos / 720) y los huecos de más de 5 minutos, y el modelo lo tolera.
 5. El clima sí se puede recuperar después desde la API histórica de Open-Meteo.
 
-**Diagrama de la arquitectura de ingesta:** [`diagramas/arquitectura.drawio`](diagramas/arquitectura.drawio) (se abre en app.diagrams.net). [EMILIANO: exportar como `diagramas/arquitectura.png` e insertarlo aquí.]
+**Diagrama de la arquitectura de ingesta** (la imagen también es editable: ábrela en app.diagrams.net):
+
+![Arquitectura](diagramas/arquitectura_ecobici.drawio.png)
 
 **D. Construcción y prueba.** Implementado en `template.yaml` y `src/ecobici/aws/`. Pruebas:
 - Automáticas (`python -m pytest`, 32 pruebas): un día completo de ingesta (720 snapshots + 24 consultas de clima) contra S3 simulado, compactación, idempotencia, esquema Parquet = tablas de Athena, ciclo de vida y compatibilidad del job con Python 3.9.
@@ -138,7 +159,7 @@ Reglas vigentes: [`evidencias/ciclo_de_vida.json`](evidencias/ciclo_de_vida.json
 
 ## Ruta 2 · Funcional (decide y documenta)
 
-> **[EMILIANO]** Secciones a cargo del perfil funcional. Las cifras técnicas que necesitas están en `docs/E2_kit_funcional.md`.
+> **[EMILIANO]** Secciones a cargo del perfil funcional. Las cifras técnicas que necesitas están en [`docs/E2_kit_funcional.md`](../docs/E2_kit_funcional.md).
 
 ### 1. Zonas y regiones
 ### 2. Caso de uso de la nube: tres razones frente a un centro de datos propio
@@ -200,7 +221,7 @@ Costo total del sistema a 12 meses (ingesta, procesamiento, almacenamiento, soli
 ### 5. Política de acceso y tabla RACI
 ### 6. Costos de almacenamiento y procesamiento
 
-Costo real de la cuenta por servicio: [`evidencias/costos_reales.md`](evidencias/costos_reales.md). Estimación a 12 meses: `docs/E2_kit_funcional.md`, sección 6.
+Costo real de la cuenta por servicio: [`evidencias/costos_reales.md`](evidencias/costos_reales.md) (0.054 USD en 9 días, ≈ 2.19 USD proyectado a 12 meses). Estimación a 12 meses: [`docs/E2_kit_funcional.md`](../docs/E2_kit_funcional.md), sección 6 (~5.92 USD x1).
 
 [EMILIANO] Comparar lo real contra lo estimado y explicar qué políticas de la Ruta 1 influyen en cada rubro.
 
@@ -258,6 +279,6 @@ Costo real de la cuenta por servicio: [`evidencias/costos_reales.md`](evidencias
 | [`evidencias/glue_corridas.md`](evidencias/glue_corridas.md) | Corridas del Job de Glue |
 | [`evidencias/ingesta.md`](evidencias/ingesta.md) | Triggers de ingesta y procesamiento activos |
 | [`evidencias/costos_reales.md`](evidencias/costos_reales.md) | Costo real por servicio y por día, sin descontar créditos |
-| [`diagramas/arquitectura.drawio`](diagramas/arquitectura.drawio) | Diagrama editable de la arquitectura (app.diagrams.net) |
+| [`diagramas/arquitectura_ecobici.drawio.png`](diagramas/arquitectura_ecobici.drawio.png) | Diagrama de la arquitectura (imagen editable en draw.io) |
 
 Se generan con `python scripts/evidencias.py --salida E2/evidencias --dia <fecha>` y `python scripts/costos_reales.py --salida E2/evidencias`.
