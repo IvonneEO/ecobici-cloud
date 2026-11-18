@@ -35,9 +35,11 @@ Todas las capas se particionan por fecha UTC (`dt=YYYY-MM-DD/`). Evidencia: [`ev
 
 | Consulta | Bytes escaneados | Lectura |
 |---|---|---|
-| Q1. Calidad por hora de un día (con filtro de partición) | PENDIENTE (ver evidencia) | Lee 1 día y 2 columnas |
-| Q2. La misma, sin filtro de partición | PENDIENTE | Lee todos los días: muestra el ahorro del particionado |
-| Q3. Estaciones que más tiempo pasaron vacías (JOIN) | PENDIENTE | Consulta de negocio |
+| Q1. Calidad por hora de un día (con filtro de partición) | 58.3 KB | Lee 1 día y 2 columnas: el caso eficiente |
+| Q2. La misma, sin filtro de partición | 394.3 KB (6.8 × Q1) | Lee todos los días: muestra el ahorro del particionado, que crece con cada día capturado |
+| Q3. Estaciones que más tiempo pasaron vacías (JOIN) | 521.6 KB | Lee 4 columnas de los hechos y el catálogo; Parquet evita leer las demás |
+
+Athena cobra un mínimo de 10 MB por consulta (~0.00005 USD), así que hoy las tres cuestan lo mismo; el particionado y Parquet son lo que mantiene el costo bajo cuando el histórico crezca. El Job de Glue procesó el 16/11/2026 en 54 s (~0.0004 USD por corrida).
 
 ### 2. Tablas con datos estructurados
 

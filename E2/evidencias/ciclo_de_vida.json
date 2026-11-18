@@ -1,0 +1,62 @@
+[
+  {
+    "Expiration": {
+      "Days": 30
+    },
+    "ID": "raw-individual-expira-30-dias",
+    "Filter": {
+      "Prefix": "bronze/"
+    },
+    "Status": "Enabled"
+  },
+  {
+    "ID": "raw-archivo-diario-a-glacier",
+    "Filter": {
+      "Prefix": "archive/"
+    },
+    "Status": "Enabled",
+    "Transitions": [
+      {
+        "Days": 30,
+        "StorageClass": "GLACIER_IR"
+      },
+      {
+        "Days": 365,
+        "StorageClass": "DEEP_ARCHIVE"
+      }
+    ]
+  },
+  {
+    "ID": "curated-a-acceso-infrecuente",
+    "Filter": {
+      "Prefix": "silver/"
+    },
+    "Status": "Enabled",
+    "Transitions": [
+      {
+        "Days": 90,
+        "StorageClass": "STANDARD_IA"
+      }
+    ]
+  },
+  {
+    "Expiration": {
+      "Days": 7
+    },
+    "ID": "athena-results-expira-7-dias",
+    "Filter": {
+      "Prefix": "athena-results/"
+    },
+    "Status": "Enabled"
+  },
+  {
+    "ID": "limpiar-cargas-incompletas",
+    "Filter": {
+      "Prefix": ""
+    },
+    "Status": "Enabled",
+    "AbortIncompleteMultipartUpload": {
+      "DaysAfterInitiation": 1
+    }
+  }
+]
