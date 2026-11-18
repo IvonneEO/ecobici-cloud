@@ -175,3 +175,35 @@ def test_lambda_de_ingesta_no_carga_pandas():
     env = {**os.environ, "PYTHONPATH": str(ROOT / "src")}
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, check=True)
     assert out.stdout.strip() == "False"
+
+
+def test_archivo_diario_del_crudo(dia):
+    """El crudo del día queda en un solo .jsonl.gz (>128 KB en producción: sí puede ir a Glacier)."""
+    import gzip
+    import json
+
+    client, res = dia
+    key = f"archive/station_status/dt={DAY}/snapshots.jsonl.gz"
+    assert res["station_status"]["archivo_crudo"]["archivo"] == key
+    lines = gzip.decompress(client.get_object(Bucket=BUCKET, Key=key)["Body"].read()).decode().splitlines()
+    assert len(lines) == 720
+    primero = json.loads(lines[0])
+    assert primero["ingested_at"].startswith(f"{DAY}") and "stations" in primero["payload"]["data"]
+    assert len(storage.list_keys(f"archive/weather/dt={DAY}/")) == 1
+
+
+def test_ciclo_de_vida_cubre_todas_las_capas():
+    tpl = yaml.load((ROOT / "template.yaml").read_text(encoding="utf-8"), Loader=_CfnLoader)
+    rules = tpl["Resources"]["DataBucket"]["Properties"]["LifecycleConfiguration"]["Rules"]
+    prefijos = {r["Prefix"] for r in rules}
+    assert {"bronze/", "archive/", "silver/", "athena-results/"} <= prefijos
+    assert all(r["Status"] == "Enabled" for r in rules)
+
+
+def test_job_de_glue_es_compatible_con_python_39():
+    """Glue Python shell corre Python 3.9: el paquete no debe usar sintaxis más nueva."""
+    import ast
+
+    for path in (ROOT / "src" / "ecobici").rglob("*.py"):
+        ast.parse(path.read_text(encoding="utf-8"), feature_version=(3, 9))
+    ast.parse((ROOT / "glue" / "curate_job.py").read_text(encoding="utf-8"), feature_version=(3, 9))

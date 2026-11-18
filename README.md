@@ -21,15 +21,22 @@ ecobici-cloud/
 │   ├── quality.py        # reglas de calidad (banderas dq_*) y en_horario
 │   ├── storage.py        # bronze/silver particionado por fecha, en local o en S3
 │   ├── run_snapshot.py   # captura local para desarrollo
+│   ├── trips.py          # viajes históricos: carga, limpieza (sin datos personales) y malla estación × hora
+│   ├── features.py       # calendario, festivos, rezagos, perfil histórico y clima (sin fuga de información)
+│   ├── modeling.py       # baselines, gradient boosting (Poisson) y métricas por segmento
 │   └── aws/
 │       ├── ingest.py     # Lambda: bronze cada 2 min (estado) y cada hora (clima)
-│       └── compact.py    # Lambda: silver diario, 1 Parquet por tabla
-├── template.yaml         # infraestructura (AWS SAM): S3, Lambdas, horarios, Athena, alarmas, presupuesto
+│       └── compact.py    # silver diario (1 Parquet por tabla) + archivo del raw; lo corre el Job de Glue
+├── glue/                 # Job de Glue (curate_job.py) y script para subirlo (upload.sh)
+├── scripts/evidencias.py # genera las evidencias del entregable desde la cuenta de AWS
+├── E2/              # entregable E2: README y evidencias
+├── template.yaml         # infraestructura (AWS SAM): S3, Lambda, Glue, horarios, Athena, alarmas, presupuesto
 ├── samconfig.toml        # configuración de despliegue
 ├── docs/DESPLIEGUE.md    # guía paso a paso para desplegar en AWS
 ├── tests/                # pruebas offline, incluido S3 simulado (moto)
 ├── notebooks/
-│   └── 01_exploracion_viajes.ipynb   # exploración de viajes históricos
+│   ├── 01_exploracion_viajes.ipynb   # exploración de viajes históricos
+│   └── 02_modelo_demanda.ipynb       # pronóstico de retiros y arribos por estación y hora
 ├── medir.py              # resumen de una captura: pesos, huecos y calidad
 └── pyproject.toml
 ```
@@ -159,7 +166,7 @@ Esquema estrella:
 EventBridge Scheduler ──(cada 2 min)──► Lambda ingest ──► S3 bronze/station_status   (JSON gzip)
                       ──(cada hora)───► Lambda ingest ──► S3 bronze/weather
                                                      └─► S3 bronze/station_information (1 vez al día)
-                      ──(00:15 UTC)───► Lambda compact ─► S3 silver/<tabla>/dt=YYYY-MM-DD/part-00000.parquet
+Glue Trigger ────────(00:15 UTC)───► Glue Job curate ─► S3 silver/<tabla>/dt=YYYY-MM-DD/part-00000.parquet (+ archive/)
                                                               │
                                             Glue Data Catalog (partition projection) ──► Athena
 CloudWatch (logs 14 días + 3 alarmas) ──► SNS ──► correo          AWS Budgets ──► correo
@@ -173,6 +180,8 @@ Decisiones de diseño:
 - **Sin ciclo de vida a Glacier.** Los objetos pesan ~7 KB y S3 no transiciona objetos de menos de 128 KB; el ahorro calculado era menor a 1%.
 - **Control de costos.** Tope de 1 GB por consulta en Athena, logs con retención de 14 días y presupuesto mensual que mide el gasto real sin descontar créditos.
 
+**Modelo de demanda (en desarrollo):** notebook `02_modelo_demanda.ipynb`, con división temporal (prueba en las últimas dos semanas), baselines de perfil histórico y semana pasada, y gradient boosting con pérdida Poisson.
+
 **Siguiente fase (propuesta):** SageMaker para entrenamiento semanal → Lambda de inferencia (cada 10 min) → DynamoDB con la última predicción por estación → dashboard.
 
 **¿Por qué S3 y no una base de datos relacional?** Lo crudo llega como JSON y se guarda tal cual para poder reprocesarlo. El proyecto es analítico, no transaccional: los snapshots solo se agregan, nunca se actualizan. Las tablas en Parquet se consultan con SQL desde Athena, y el costo es menor a 1 USD al mes en el escenario actual. DynamoDB se usa solo para la consulta rápida de la predicción por estación.
@@ -183,7 +192,8 @@ Decisiones de diseño:
 
 ## Próximos pasos
 
-- Acumular al menos dos semanas de snapshots en AWS antes de entrenar.
+- Correr el notebook 02 con los viajes reales y documentar los resultados contra los baselines.
+- Convertir la demanda pronosticada en disponibilidad (`bicis en 1 h ≈ bicis ahora + neto pronosticado`) y validarla con los snapshots de AWS cuando haya dos semanas de captura.
 - Cruzar viajes con clima histórico para medir el efecto de la lluvia en la demanda.
 - Entrenar el modelo base de pronóstico por estación.
 
