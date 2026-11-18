@@ -128,6 +128,8 @@ Reglas vigentes: [`evidencias/ciclo_de_vida.json`](evidencias/ciclo_de_vida.json
 4. **Un snapshot perdido no se puede recuperar,** porque el feed solo da el estado actual. Por eso el Job de Glue mide y reporta la completitud del día (snapshots recibidos / 720) y los huecos de más de 5 minutos, y el modelo lo tolera.
 5. El clima sí se puede recuperar después desde la API histórica de Open-Meteo.
 
+**Diagrama de la arquitectura de ingesta:** [`diagramas/arquitectura.drawio`](diagramas/arquitectura.drawio) (se abre en app.diagrams.net). [EMILIANO: exportar como `diagramas/arquitectura.png` e insertarlo aquí.]
+
 **D. Construcción y prueba.** Implementado en `template.yaml` y `src/ecobici/aws/`. Pruebas:
 - Automáticas (`python -m pytest`, 32 pruebas): un día completo de ingesta (720 snapshots + 24 consultas de clima) contra S3 simulado, compactación, idempotencia, esquema Parquet = tablas de Athena, ciclo de vida y compatibilidad del job con Python 3.9.
 - En la nube: completitud medida en [`evidencias/glue_corridas.md`](evidencias/glue_corridas.md) y triggers activos en [`evidencias/ingesta.md`](evidencias/ingesta.md).
@@ -141,9 +143,66 @@ Reglas vigentes: [`evidencias/ciclo_de_vida.json`](evidencias/ciclo_de_vida.json
 ### 1. Zonas y regiones
 ### 2. Caso de uso de la nube: tres razones frente a un centro de datos propio
 ### 3. ADR de entrada y almacenamiento
+
+**Título:** [EMILIANO] p. ej. "Ingesta programada con Lambda y almacenamiento en S3 + Athena"
+
+**Contexto:** el feed de Ecobici solo publica el estado actual de ~677 estaciones (~7 KB comprimido), así que hay que consultarlo periódicamente y guardar cada foto para construir el histórico. Las consultas actuales son por lotes (análisis y entrenamiento), no en tiempo real.
+
+**Decisión:** [EMILIANO] Lo implementado: EventBridge Scheduler cada 2 min → Lambda → S3 (raw) y Parquet en S3 consultado con Athena (curated). Confirma y explica por qué.
+
+**Alternativas de entrada:**
+
+| Alternativa | Costo/mes (x1) | Riesgo |
+|---|---|---|
+| EventBridge Scheduler + Lambda (implementado) | ~0.15 USD | Límite de 15 min por ejecución (hoy tarda 1–2 s) |
+| EC2 t4g.nano con cron | ~3 USD + mantenimiento | Hay que parcharlo; si se cae, se detiene la captura |
+| Kinesis Data Streams | ~29 USD | Sobredimensionado: la fuente no es un flujo continuo |
+
+**Alternativas de almacenamiento:**
+
+| Alternativa | Costo/mes (x1) | Riesgo |
+|---|---|---|
+| S3 + Parquet + Athena (implementado) | ~0.25 USD | Consultas en segundos, no en milisegundos |
+| DynamoDB | ~9 USD (14.6 M escrituras/mes) | Caro para análisis por lotes; no sirve para SQL analítico |
+| RDS PostgreSQL db.t4g.micro | ~12 USD | Encendida 24/7 aunque no se use; hay que administrarla |
+
+**Consecuencias:** [EMILIANO] Qué se gana, qué se pierde y qué vigilar.
+
+**Condición de cambio:** [EMILIANO] Un número. Ideas: frecuencia menor a 1 min o más de 10 fuentes → Kinesis; más de 1 millón de consultas por llave al día → DynamoDB.
+
+**Fecha y responsable:** [EMILIANO]
+
 ### 4. ADR de procesamiento (costo total a 12 meses, x1 y x3)
+
+**Título:** [EMILIANO] p. ej. "Transformación diaria raw → curated con Glue Python shell"
+
+**Contexto:** cada día llegan ~720 snapshots (~5 MB) que hay que limpiar, validar y convertir a Parquet particionado para consultarlos barato. El volumen es pequeño y el proceso corre una vez al día.
+
+**Decisión:** [EMILIANO] Lo implementado: Job de Glue Python shell (0.0625 DPU), trigger diario a las 00:15 UTC; la primera corrida tardó 54 s. Confirma y explica por qué.
+
+**Alternativas (x3 = tres veces el volumen):**
+
+| Alternativa | 12 meses x1 | 12 meses x3 | Riesgo |
+|---|---|---|---|
+| Glue Python shell, 0.0625 DPU (implementado) | 0.33 USD | 1.00 USD | Un solo nodo: no escala a volúmenes grandes |
+| Glue Spark (mínimo 2 DPU) | 10.70 USD | 32.10 USD | ~32 veces más caro sin necesidad a este volumen |
+| Lambda (1 GB, ~60 s) | 0.37 USD | 1.09 USD | Límite de 15 min y 10 GB de memoria |
+| EMR | >100 USD | >100 USD | Clúster sobredimensionado |
+
+Costo total del sistema a 12 meses (ingesta, procesamiento, almacenamiento, solicitudes y consultas): ~5.92 USD (x1) y ~17.76 USD (x3).
+
+**Consecuencias:** [EMILIANO]
+
+**Condición de cambio:** [EMILIANO] Idea: si el raw diario supera 1 GB o el job tarda más de 10 minutos, migrar a Glue Spark.
+
+**Fecha y responsable:** [EMILIANO]
+
 ### 5. Política de acceso y tabla RACI
 ### 6. Costos de almacenamiento y procesamiento
+
+Costo real de la cuenta por servicio: [`evidencias/costos_reales.md`](evidencias/costos_reales.md). Estimación a 12 meses: `docs/E2_kit_funcional.md`, sección 6.
+
+[EMILIANO] Comparar lo real contra lo estimado y explicar qué políticas de la Ruta 1 influyen en cada rubro.
 
 ---
 
@@ -198,5 +257,7 @@ Reglas vigentes: [`evidencias/ciclo_de_vida.json`](evidencias/ciclo_de_vida.json
 | [`evidencias/ciclo_de_vida.json`](evidencias/ciclo_de_vida.json) | Reglas de ciclo de vida activas en el bucket |
 | [`evidencias/glue_corridas.md`](evidencias/glue_corridas.md) | Corridas del Job de Glue |
 | [`evidencias/ingesta.md`](evidencias/ingesta.md) | Triggers de ingesta y procesamiento activos |
+| [`evidencias/costos_reales.md`](evidencias/costos_reales.md) | Costo real por servicio y por día, sin descontar créditos |
+| [`diagramas/arquitectura.drawio`](diagramas/arquitectura.drawio) | Diagrama editable de la arquitectura (app.diagrams.net) |
 
-Se generan con `python scripts/evidencias.py --salida E2/evidencias --dia <fecha>`.
+Se generan con `python scripts/evidencias.py --salida E2/evidencias --dia <fecha>` y `python scripts/costos_reales.py --salida E2/evidencias`.
