@@ -26,8 +26,11 @@ ecobici-cloud/
 │   ├── modeling.py       # baselines, gradient boosting (Poisson) y métricas por segmento
 │   └── aws/
 │       ├── ingest.py     # Lambda: bronze cada 2 min (estado) y cada hora (clima)
-│       └── compact.py    # Lambda: silver diario, 1 Parquet por tabla
-├── template.yaml         # infraestructura (AWS SAM): S3, Lambdas, horarios, Athena, alarmas, presupuesto
+│       └── compact.py    # silver diario (1 Parquet por tabla) + archivo del raw; lo corre el Job de Glue
+├── glue/                 # Job de Glue (curate_job.py) y script para subirlo (upload.sh)
+├── scripts/evidencias.py # genera las evidencias del entregable desde la cuenta de AWS
+├── E2_EQxx/              # entregable E2: README y evidencias
+├── template.yaml         # infraestructura (AWS SAM): S3, Lambda, Glue, horarios, Athena, alarmas, presupuesto
 ├── samconfig.toml        # configuración de despliegue
 ├── docs/DESPLIEGUE.md    # guía paso a paso para desplegar en AWS
 ├── tests/                # pruebas offline, incluido S3 simulado (moto)
@@ -163,7 +166,7 @@ Esquema estrella:
 EventBridge Scheduler ──(cada 2 min)──► Lambda ingest ──► S3 bronze/station_status   (JSON gzip)
                       ──(cada hora)───► Lambda ingest ──► S3 bronze/weather
                                                      └─► S3 bronze/station_information (1 vez al día)
-                      ──(00:15 UTC)───► Lambda compact ─► S3 silver/<tabla>/dt=YYYY-MM-DD/part-00000.parquet
+Glue Trigger ────────(00:15 UTC)───► Glue Job curate ─► S3 silver/<tabla>/dt=YYYY-MM-DD/part-00000.parquet (+ archive/)
                                                               │
                                             Glue Data Catalog (partition projection) ──► Athena
 CloudWatch (logs 14 días + 3 alarmas) ──► SNS ──► correo          AWS Budgets ──► correo

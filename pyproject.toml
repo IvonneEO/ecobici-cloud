@@ -1,7 +1,7 @@
 [project]
 name = "ecobici-cloud"
 version = "0.2.0"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 # La ingesta solo usa la librería estándar; pandas/pyarrow son para silver y análisis.
 dependencies = ["pandas>=2.1", "pyarrow>=15"]
 

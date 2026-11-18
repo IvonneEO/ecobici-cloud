@@ -2,7 +2,8 @@ AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: >
   Ecobici Cloud: ingesta del feed GBFS de Ecobici y del clima de Open-Meteo a S3,
-  compactación diaria a Parquet, catálogo para Athena, monitoreo y presupuesto.
+  Job de Glue diario raw -> curated (Parquet), catálogo para Athena, ciclo de vida,
+  monitoreo y presupuesto.
 
 Parameters:
   AlertEmail:
@@ -12,11 +13,6 @@ Parameters:
     Type: Number
     Default: 5
     Description: Presupuesto mensual de la cuenta en USD (sin descontar créditos).
-  PandasLayerArn:
-    Type: String
-    # Capa administrada "AWS SDK for pandas" (pandas + pyarrow) para Python 3.12 x86_64 en us-east-1.
-    # Lista vigente: https://aws-sdk-pandas.readthedocs.io/en/stable/layers.html
-    Default: arn:aws:lambda:us-east-1:336392948345:layer:AWSSDKPandas-Python312:32
   DataStartDate:
     Type: String
     Default: "2026-11-01"
@@ -51,8 +47,35 @@ Resources:
       OwnershipControls:
         Rules:
           - ObjectOwnership: BucketOwnerEnforced
-      # Sin reglas de ciclo de vida a Glacier: los objetos pesan ~7 KB y S3 no
-      # transiciona objetos de menos de 128 KB; además el ahorro calculado era <1%.
+      # Ciclo de vida (ver E2_EQxx/README.md, sección de costos y retención):
+      # - bronze/ (JSON de ~7 KB por snapshot) no puede pasar a Glacier (mínimo 128 KB),
+      #   así que el Job de Glue lo archiva a diario en archive/ y los individuales expiran.
+      LifecycleConfiguration:
+        Rules:
+          - Id: raw-individual-expira-30-dias
+            Status: Enabled
+            Prefix: bronze/
+            ExpirationInDays: 30
+          - Id: raw-archivo-diario-a-glacier
+            Status: Enabled
+            Prefix: archive/
+            Transitions:
+              - {StorageClass: GLACIER_IR, TransitionInDays: 30}
+              - {StorageClass: DEEP_ARCHIVE, TransitionInDays: 365}
+          - Id: curated-a-acceso-infrecuente
+            Status: Enabled
+            Prefix: silver/
+            Transitions:
+              - {StorageClass: STANDARD_IA, TransitionInDays: 90}
+          - Id: athena-results-expira-7-dias
+            Status: Enabled
+            Prefix: athena-results/
+            ExpirationInDays: 7
+          - Id: limpiar-cargas-incompletas
+            Status: Enabled
+            Prefix: ""
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
       Tags:
         - Key: proyecto
           Value: ecobici-cloud
@@ -79,12 +102,6 @@ Resources:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub "/ecobici/${AWS::StackName}/ingest"
-      RetentionInDays: 14
-
-  CompactLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub "/ecobici/${AWS::StackName}/compact"
       RetentionInDays: 14
 
   # ---------------------------------------------------------------- Lambdas
@@ -127,39 +144,84 @@ Resources:
             RetryPolicy:
               MaximumRetryAttempts: 2
 
-  CompactFunction:
-    Type: AWS::Serverless::Function
+  # ---------------------------------------------------------------- Glue: raw -> curated
+  GlueJobRole:
+    Type: AWS::IAM::Role
     Properties:
-      Description: Junta los snapshots del día anterior en un Parquet por tabla y aplica reglas de calidad.
-      Handler: ecobici.aws.compact.handler
-      MemorySize: 1024
-      Timeout: 600
-      Layers:
-        - !Ref PandasLayerArn
-      LoggingConfig:
-        LogGroup: !Ref CompactLogGroup
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: {Service: glue.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
       Policies:
-        - Statement:
-            - Effect: Allow
-              Action: s3:GetObject
-              Resource: !Sub "${DataBucket.Arn}/bronze/*"
-            - Effect: Allow
-              Action: s3:PutObject
-              Resource: !Sub "${DataBucket.Arn}/silver/*"
-            - Effect: Allow
-              Action: s3:ListBucket
-              Resource: !GetAtt DataBucket.Arn
-              Condition:
-                StringLike:
-                  s3:prefix: ["bronze/*"]
-      Events:
-        DiarioUTC:
-          Type: ScheduleV2
-          Properties:
-            ScheduleExpression: cron(15 0 * * ? *)   # 00:15 UTC = 18:15 en CDMX
-            Input: "{}"
-            RetryPolicy:
-              MaximumRetryAttempts: 2
+        - PolicyName: curate-minimo-privilegio
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - !Sub "${DataBucket.Arn}/bronze/*"
+                  - !Sub "${DataBucket.Arn}/glue/*"
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource:
+                  - !Sub "${DataBucket.Arn}/silver/*"
+                  - !Sub "${DataBucket.Arn}/archive/*"
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt DataBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix: ["bronze/*"]
+
+  CurateJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${AWS::StackName}-curate"
+      Description: Convierte el raw (bronze) del día anterior en Parquet particionado (silver) y archiva el crudo.
+      Role: !GetAtt GlueJobRole.Arn
+      Command:
+        Name: pythonshell
+        PythonVersion: "3.9"
+        ScriptLocation: !Sub "s3://${DataBucket}/glue/curate_job.py"
+      MaxCapacity: 0.0625          # la capacidad mínima de Glue: ~0.0005 USD por corrida
+      Timeout: 30                  # minutos
+      MaxRetries: 1
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      DefaultArguments:
+        "--ECOBICI_BUCKET": !Ref DataBucket
+        "--PACKAGE_KEY": glue/libs/ecobici.zip
+        library-set: analytics     # pandas, pyarrow y boto3 preinstalados
+      Tags:
+        proyecto: ecobici-cloud
+
+  CurateTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !Sub "${AWS::StackName}-curate-diario"
+      Description: Todos los días a las 00:15 UTC (18:15 en CDMX) procesa el día UTC anterior.
+      Type: SCHEDULED
+      Schedule: cron(15 0 * * ? *)
+      StartOnCreation: true
+      Actions:
+        - JobName: !Ref CurateJob
+
+  CurateFailureRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Avisa por correo si el Job de Glue falla o se pasa de tiempo.
+      EventPattern:
+        source: [aws.glue]
+        detail-type: [Glue Job State Change]
+        detail:
+          jobName: [!Ref CurateJob]
+          state: [FAILED, TIMEOUT, ERROR]
+      Targets:
+        - Id: correo
+          Arn: !Ref AlertsTopic
 
   # ---------------------------------------------------------------- Catálogo y Athena
   GlueDatabase:
@@ -307,6 +369,37 @@ Resources:
         - Protocol: email
           Endpoint: !Ref AlertEmail
 
+  AlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlertsTopic]
+      PolicyDocument:
+        Statement:
+          - Sid: DuenoDeLaCuenta
+            Effect: Allow
+            Principal: {AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"}
+            Action:
+              - sns:GetTopicAttributes
+              - sns:SetTopicAttributes
+              - sns:Subscribe
+              - sns:ListSubscriptionsByTopic
+              - sns:Publish
+            Resource: !Ref AlertsTopic
+          - Sid: AlarmasDeCloudWatch
+            Effect: Allow
+            Principal: {Service: cloudwatch.amazonaws.com}
+            Action: sns:Publish
+            Resource: !Ref AlertsTopic
+            Condition:
+              StringEquals: {aws:SourceAccount: !Ref AWS::AccountId}
+          - Sid: FallasDelJobDeGlue
+            Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: sns:Publish
+            Resource: !Ref AlertsTopic
+            Condition:
+              ArnEquals: {aws:SourceArn: !GetAtt CurateFailureRule.Arn}
+
   IngestErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -338,21 +431,6 @@ Resources:
       TreatMissingData: breaching
       AlarmActions: [!Ref AlertsTopic]
       OKActions: [!Ref AlertsTopic]
-
-  CompactErrorsAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmDescription: La compactación diaria falló.
-      Namespace: AWS/Lambda
-      MetricName: Errors
-      Dimensions: [{Name: FunctionName, Value: !Ref CompactFunction}]
-      Statistic: Sum
-      Period: 3600
-      EvaluationPeriods: 1
-      Threshold: 1
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref AlertsTopic]
 
   MonthlyBudget:
     Type: AWS::Budgets::Budget
@@ -386,7 +464,8 @@ Outputs:
     Value: !Ref DataBucket
   IngestFunctionName:
     Value: !Ref IngestFunction
-  CompactFunctionName:
-    Value: !Ref CompactFunction
+  CurateJobName:
+    Description: Job de Glue raw -> curated
+    Value: !Ref CurateJob
   AthenaWorkGroupName:
     Value: !Ref AthenaWorkGroup

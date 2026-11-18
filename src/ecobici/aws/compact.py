@@ -1,17 +1,19 @@
-"""Lambda de compactación diaria: bronze (JSON por snapshot) -> silver (1 Parquet por día).
+"""Compactación diaria: bronze (JSON por snapshot) -> silver (1 Parquet por día) + archivo del crudo.
+
+La ejecuta el Job de Glue `curate` (glue/curate_job.py) a las 00:15 UTC.
 
 Por qué existe:
 - Resuelve el problema de "archivos pequeños" medido en la primera captura
   (un Parquet por snapshot pesaba más que el JSON crudo).
 - Aplica las reglas de calidad y la bandera en_horario a todo el día.
 - Es idempotente: correrla otra vez para el mismo día reescribe los mismos archivos.
-
-Disparada por EventBridge Scheduler a las 00:15 UTC para el día UTC anterior.
-También se puede invocar a mano: {"date": "2026-11-10"}.
-Necesita pandas y pyarrow: los toma de la capa administrada "AWS SDK for pandas".
+- Archiva el crudo del día en un solo .jsonl.gz (archive/), porque S3 no transiciona
+  a Glacier objetos de menos de 128 KB y cada snapshot pesa ~7 KB. Así los JSON
+  individuales de bronze pueden expirar y el crudo se conserva barato.
 """
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -38,6 +40,15 @@ def _read_all(keys: list[str]) -> list[tuple[datetime, dict]]:
     return [(_epoch(k), p) for k, p in zip(keys, payloads)]
 
 
+def _archive(source: str, day: date, items: list[tuple[datetime, dict]]) -> dict:
+    """Un .jsonl.gz por fuente y día con todos los payloads crudos, en orden."""
+    lines = (json.dumps({"ingested_at": ts.isoformat(), "payload": p}, ensure_ascii=False) for ts, p in items)
+    data = gzip.compress("\n".join(lines).encode("utf-8"))
+    key = f"archive/{source}/dt={day:%Y-%m-%d}/snapshots.jsonl.gz"
+    storage.put_bytes(key, data, "application/gzip")
+    return {"archivo": key, "registros": len(items), "bytes": len(data)}
+
+
 def _latest_catalog(day: date) -> tuple[dict, date]:
     """Catálogo del día; si no hay (p. ej. la ingesta empezó tarde), el más reciente previo."""
     for back in range(CATALOG_LOOKBACK_DAYS + 1):
@@ -56,8 +67,11 @@ def compact_status(day: date, ts_day: datetime) -> dict:
     cat_raw, cat_day = _latest_catalog(day)
     info = gbfs.station_information_df(cat_raw)
 
+    snapshots = _read_all(keys)
+    archivo = _archive("station_status", day, snapshots)
+
     # Las reglas se aplican snapshot por snapshot (dq_duplicado es dentro de un snapshot).
-    frames = [quality.check_status(gbfs.station_status_df(p, ts), info) for ts, p in _read_all(keys)]
+    frames = [quality.check_status(gbfs.station_status_df(p, ts), info) for ts, p in snapshots]
     df = pd.concat(frames, ignore_index=True)
 
     storage.write_silver("fact_station_status", df, ts_day, name="part-00000")
@@ -72,6 +86,7 @@ def compact_status(day: date, ts_day: datetime) -> dict:
         "filas": int(len(df)),
         "catalogo_de": f"{cat_day}",
         "calidad": quality.summary(df),
+        "archivo_crudo": archivo,
     }
 
 
@@ -79,8 +94,10 @@ def compact_weather(day: date, ts_day: datetime) -> dict:
     keys = storage.list_keys(f"bronze/weather/dt={day:%Y-%m-%d}/")
     if not keys:
         return {"consultas": 0}
+    items = _read_all(keys)
+    _archive("weather", day, items)
     frames = []
-    for fetched_at, payload in _read_all(keys):
+    for fetched_at, payload in items:
         w = weather.weather_df(payload)
         w["fetched_at"] = pd.Timestamp(fetched_at)
         frames.append(w)
