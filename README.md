@@ -29,7 +29,7 @@ ecobici-cloud/
 │       └── compact.py    # silver diario (1 Parquet por tabla) + archivo del raw; lo corre el Job de Glue
 ├── glue/                 # Job de Glue (curate_job.py) y script para subirlo (upload.sh)
 ├── scripts/evidencias.py # genera las evidencias del entregable desde la cuenta de AWS
-├── E2_EQxx/              # entregable E2: README y evidencias
+├── E2/              # entregable E2: README y evidencias
 ├── template.yaml         # infraestructura (AWS SAM): S3, Lambda, Glue, horarios, Athena, alarmas, presupuesto
 ├── samconfig.toml        # configuración de despliegue
 ├── docs/DESPLIEGUE.md    # guía paso a paso para desplegar en AWS

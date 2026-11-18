@@ -1,8 +1,8 @@
 """Genera las evidencias del entregable E2 a partir de la cuenta de AWS real.
 
 Uso (desde la raíz del proyecto, con credenciales configuradas):
-    python scripts/evidencias.py --salida E2_EQxx/evidencias            # día = ayer (UTC)
-    python scripts/evidencias.py --salida E2_EQxx/evidencias --dia 2026-11-12
+    python scripts/evidencias.py --salida E2/evidencias            # día = ayer (UTC)
+    python scripts/evidencias.py --salida E2/evidencias --dia 2026-11-12
 
 Escribe:
     athena_consultas.md   3 consultas con bytes escaneados, tiempo y costo

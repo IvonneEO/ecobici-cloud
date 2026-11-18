@@ -47,7 +47,7 @@ Resources:
       OwnershipControls:
         Rules:
           - ObjectOwnership: BucketOwnerEnforced
-      # Ciclo de vida (ver E2_EQxx/README.md, sección de costos y retención):
+      # Ciclo de vida (ver E2/README.md, sección de costos y retención):
       # - bronze/ (JSON de ~7 KB por snapshot) no puede pasar a Glacier (mínimo 128 KB),
       #   así que el Job de Glue lo archiva a diario en archive/ y los individuales expiran.
       LifecycleConfiguration:

@@ -1,6 +1,6 @@
 # E2 · Ecobici Cloud: predicción de disponibilidad por estación
 
-**Equipo:** EQxx · **Perfil técnico:** Ivonne Enciso · **Perfil funcional:** Emiliano
+**Perfil técnico:** Ivonne Enciso · **Perfil funcional:** Emiliano
 **Repositorio:** código en la raíz del repo; este folder contiene el entregable y sus evidencias.
 
 ## Resumen
@@ -197,4 +197,4 @@ Reglas vigentes: [`evidencias/ciclo_de_vida.json`](evidencias/ciclo_de_vida.json
 | [`evidencias/glue_corridas.md`](evidencias/glue_corridas.md) | Corridas del Job de Glue |
 | [`evidencias/ingesta.md`](evidencias/ingesta.md) | Triggers de ingesta y procesamiento activos |
 
-Se generan con `python scripts/evidencias.py --salida E2_EQxx/evidencias --dia <fecha>`.
+Se generan con `python scripts/evidencias.py --salida E2/evidencias --dia <fecha>`.

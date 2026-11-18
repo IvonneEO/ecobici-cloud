@@ -1,6 +1,6 @@
 # Kit para la Ruta 2 (perfil funcional) · E2
 
-Este documento reúne las cifras y hechos técnicos que necesita el perfil funcional para escribir su parte del entregable. **Las decisiones y la redacción son del perfil funcional**; aquí hay datos, alternativas ya costeadas y propuestas para discutir. Todo lo que escribas va en `E2_EQxx/README.md`, en las secciones marcadas `[EMILIANO]`.
+Este documento reúne las cifras y hechos técnicos que necesita el perfil funcional para escribir su parte del entregable. **Las decisiones y la redacción son del perfil funcional**; aquí hay datos, alternativas ya costeadas y propuestas para discutir. Todo lo que escribas va en `E2/README.md`, en las secciones marcadas `[EMILIANO]`.
 
 Precios: lista de AWS en **us-east-1**, en **USD**, sin capa gratuita, consultados el 13/11/2026.
 
@@ -112,7 +112,7 @@ Lecturas útiles:
 
 ## Pendientes que solo puede resolver el perfil funcional
 
-- Número de equipo (para renombrar `E2_EQxx`).
+- Número de equipo (para renombrar `E2`).
 - Nombre del dueño de datos en la tabla de linaje.
 - Decisión sobre replicación entre regiones, con su condición de cambio.
 - Redacción de los dos ADR, con fecha y responsable.
